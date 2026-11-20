@@ -6,11 +6,13 @@ Videos, channels, playlists, comments and counters live in PostgreSQL.
 
 ## Deploy on Render
 
-1. Put these files in a new GitHub repository.
-2. On https://render.com choose New > Blueprint and select the repository.
-3. Render asks for `ADMIN_PASSWORD`. Type your admin password there.
-   It lives only in Render's environment settings, never in the code or the repo.
-4. Click Apply, then open the URL Render gives you.
+1. Upload the **contents** of this ZIP to the root of a new GitHub repository (so `render.yaml` is at the repository root, not inside another folder).
+2. In Render, choose **New > Blueprint**, then select that GitHub repository. Do not create only a standalone Web Service.
+3. Render reads `render.yaml` and creates both the web service and the `opentube-db` PostgreSQL database. It wires the database connection into `DATABASE_URL` automatically.
+4. When prompted, enter `ADMIN_PASSWORD` (optional; leaving it unset disables admin tools).
+5. Apply the Blueprint and wait for both the database and web service to finish provisioning.
+
+**If you already created the Web Service manually:** open its Settings and change the Start Command to `npm start`, then create/attach a PostgreSQL database and add `DATABASE_URL` under Environment using that database's **Internal Database URL**. The ZIP cannot contain a working database URL: Render generates it for your own database. The easiest clean setup is to deploy this repository as a Blueprint.
 
 To change the password later: Render dashboard > your service > Environment >
 edit ADMIN_PASSWORD, then save (the service redeploys).
