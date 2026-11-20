@@ -6,6 +6,9 @@ const crypto = require("crypto");
 
 const PORT = process.env.PORT || 3000;
 const MAX_MB = Number(process.env.MAX_MB || 50);
+const RTMP_PUBLIC_URL = String(process.env.RTMP_PUBLIC_URL || "rtmp://localhost:1935/live").replace(/\/$/, "");
+const HLS_PUBLIC_URL = String(process.env.HLS_PUBLIC_URL || "http://localhost:8888").replace(/\/$/, "");
+const STREAM_AUTH_SECRET = process.env.STREAM_AUTH_SECRET || "";
 const CHUNK = 4 * 1024 * 1024;
 
 if (!process.env.DATABASE_URL) {
@@ -69,7 +72,7 @@ app.use((req, res, next) => {
     "X-Frame-Options": "DENY",
     "Referrer-Policy": "no-referrer",
     "Content-Security-Policy":
-      "default-src 'self'; img-src 'self' data:; media-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+      "default-src 'self'; img-src 'self' data:; media-src 'self' blob: https:; connect-src 'self' https:; style-src 'self' 'unsafe-inline'; script-src 'self' https://cdn.jsdelivr.net; worker-src blob:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
   });
   next();
 });
@@ -89,7 +92,7 @@ const needAdmin = (req, res, next) => (isAdmin(req) ? next() : forbid(res));
 
 /* ---------- config + admin ---------- */
 app.get("/api/config", (req, res) =>
-  res.json({ maxMb: MAX_MB, admin: isAdmin(req), adminEnabled: !!ADMIN }));
+  res.json({ maxMb: MAX_MB, admin: isAdmin(req), adminEnabled: !!ADMIN, liveConfigured: !!STREAM_AUTH_SECRET, rtmpUrl: RTMP_PUBLIC_URL, hlsUrl: HLS_PUBLIC_URL }));
 
 app.post("/api/admin/login", rate("login", 8, 15 * 60e3), (req, res) => {
   if (!ADMIN) return res.status(503).json({ error: "Admin is not set up on this server." });
@@ -159,33 +162,108 @@ app.delete("/api/channels/:id", wrap(async (req, res) => {
   res.json({ ok: true });
 }));
 
+/* ---------- live streaming (MediaMTX + OBS) ---------- */
+const liveKeyHash = (v) => sha(String(v || "")).toString("hex");
+app.get("/api/live", wrap(async (req, res) => {
+  const r = await q(`select l.channel_id, l.title, l.quality, c.name as channel,
+    (extract(epoch from l.created) * 1000)::float8 as date
+    from live_streams l join channels c on c.id = l.channel_id order by l.created desc`);
+  res.json(r.rows);
+}));
+app.get("/api/live/mine", wrap(async (req, res) => {
+  const cid = int(req.get("x-channel-id"));
+  if (!cid || !(await owns(req, cid))) return forbid(res);
+  const r = await q("select channel_id, title, quality from live_streams where channel_id = $1", [cid]);
+  res.json(r.rows[0] || null);
+}));
+app.post("/api/live", rate("live", 10, 3600e3), wrap(async (req, res) => {
+  const cid = int(req.get("x-channel-id"));
+  if (!cid || !(await owns(req, cid))) return forbid(res);
+  if (!STREAM_AUTH_SECRET) return res.status(503).json({ error: "Live streaming is not configured yet. Set STREAM_AUTH_SECRET and deploy the MediaMTX server first." });
+  const title = String(req.body.title || "Live stream").trim().slice(0, 100) || "Live stream";
+  const quality = ["480p", "720p", "1080p", "1440p", "2160p"].includes(req.body.quality) ? req.body.quality : "1080p";
+  const key = crypto.randomBytes(24).toString("hex");
+  await q(`insert into live_streams (channel_id, title, quality, key_hash)
+    values ($1,$2,$3,$4) on conflict (channel_id) do update set title=excluded.title, quality=excluded.quality, key_hash=excluded.key_hash, created=now()`,
+    [cid, title, quality, liveKeyHash(key)]);
+  res.json({ ok: true, channelId: cid, title, quality, rtmpUrl: RTMP_PUBLIC_URL,
+    streamKey: `${cid}?user=${cid}&pass=${key}`, watchUrl: `${HLS_PUBLIC_URL}/live/${cid}/index.m3u8` });
+}));
+app.post("/api/live/rotate", rate("livekey", 8, 3600e3), wrap(async (req, res) => {
+  const cid = int(req.get("x-channel-id"));
+  if (!cid || !(await owns(req, cid))) return forbid(res);
+  const key = crypto.randomBytes(24).toString("hex");
+  const r = await q("update live_streams set key_hash=$2, created=now() where channel_id=$1 returning channel_id", [cid, liveKeyHash(key)]);
+  if (!r.rows[0]) return notFound(res);
+  res.json({ rtmpUrl: RTMP_PUBLIC_URL, streamKey: `${cid}?user=${cid}&pass=${key}` });
+}));
+app.delete("/api/live", wrap(async (req, res) => {
+  const cid = int(req.get("x-channel-id"));
+  if (!cid || !(await owns(req, cid))) return forbid(res);
+  await q("delete from live_streams where channel_id=$1", [cid]);
+  res.json({ ok: true });
+}));
+// MediaMTX calls this endpoint for every publish/read request. Viewers are public;
+// publishing requires the channel's private key and the shared webhook secret.
+app.post("/api/stream-auth", wrap(async (req, res) => {
+  const supplied = String(req.query.secret || "");
+  if (!STREAM_AUTH_SECRET || !same(Buffer.from(supplied), Buffer.from(STREAM_AUTH_SECRET))) return res.sendStatus(401);
+  const action = String(req.body.action || ""), match = /^\/?live\/(\d+)$/.exec(String(req.body.path || ""));
+  if (!match) return res.sendStatus(401);
+  const cid = int(match[1]);
+  const r = await q("select key_hash from live_streams where channel_id=$1", [cid]);
+  if (!r.rows[0]) return res.sendStatus(401);
+  if (action === "publish") {
+    const password = String(req.body.password || "");
+    if (!password || !same(Buffer.from(liveKeyHash(password)), Buffer.from(r.rows[0].key_hash))) return res.sendStatus(401);
+    return res.sendStatus(200);
+  }
+  if (action === "read") return res.sendStatus(200);
+  return res.sendStatus(401);
+}));
+
 /* ---------- videos ---------- */
 app.get("/api/videos", wrap(async (req, res) => {
   const ch = /^\d+$/.test(req.query.channel || "") ? int(req.query.channel) : null;
+  const type = String(req.query.type || "");
+  const params = [];
+  const where = [];
+  if (ch) { params.push(ch); where.push(`v.channel_id = $${params.length}`); }
+  if (type === "shorts") where.push("v.is_short = true");
+  if (type === "premieres") where.push("v.status = 'scheduled' and v.premiere_at > now()");
+  else if (!(ch && await owns(req, ch))) where.push("(v.status <> 'scheduled' or v.premiere_at <= now())");
   const r = await q(`
-    select v.id, v.title, v.descr as "desc", v.thumb, v.duration, v.views, v.likes, v.channel_id, c.name as channel,
-           (extract(epoch from v.created) * 1000)::float8 as date
+    select v.id, v.title, v.descr as "desc", v.thumb, v.duration, v.views, v.likes, v.dislikes,
+      v.is_short, v.status, (extract(epoch from v.premiere_at) * 1000)::float8 as premiere_at,
+      v.channel_id, c.name as channel, (extract(epoch from v.created) * 1000)::float8 as date
     from videos v left join channels c on c.id = v.channel_id
-    ${ch ? "where v.channel_id = $1" : ""} order by v.created desc`, ch ? [ch] : []);
+    ${where.length ? "where " + where.join(" and ") : ""} order by coalesce(v.premiere_at, v.created) desc`, params);
   res.json(r.rows);
 }));
 
 app.get("/api/videos/:id", wrap(async (req, res) => {
   const id = int(req.params.id);
   const r = await q(`
-    select v.id, v.title, v.descr as "desc", v.duration, v.views, v.likes, v.channel_id, c.name as channel,
-           (extract(epoch from v.created) * 1000)::float8 as date
+    select v.id, v.title, v.descr as "desc", v.thumb, v.duration, v.views, v.likes, v.dislikes,
+      v.is_short, v.status, (extract(epoch from v.premiere_at) * 1000)::float8 as premiere_at,
+      v.channel_id, c.name as channel, (extract(epoch from v.created) * 1000)::float8 as date
     from videos v left join channels c on c.id = v.channel_id where v.id = $1`, [id]);
   if (!r.rows[0]) return notFound(res);
   const cm = await q(`select id, body as x, (extract(epoch from created) * 1000)::float8 as t
     from comments where video_id = $1 order by created desc`, [id]);
-  res.json({ ...r.rows[0], comments: cm.rows });
+  const viewer = String(req.get("x-viewer-id") || "").slice(0, 80);
+  const votes = viewer ? await q(`select count(*) filter (where vote=1)::int as likes,
+    count(*) filter (where vote=-1)::int as dislikes,
+    coalesce((select vote from video_votes where video_id=$1 and viewer_id=$2),0)::int as my_vote
+    from video_votes where video_id=$1`, [id, viewer]) : { rows: [{ likes: 0, dislikes: 0, my_vote: 0 }] };
+  res.json({ ...r.rows[0], vote_counts: votes.rows[0], comments: cm.rows });
 }));
 
 app.get("/api/videos/:id/stream", wrap(async (req, res) => {
   const id = int(req.params.id);
-  const m = await q("select mime, size from videos where id = $1", [id]);
+  const m = await q("select mime, size, channel_id, status, premiere_at from videos where id = $1", [id]);
   if (!m.rows[0]) return res.sendStatus(404);
+  if (m.rows[0].status === "scheduled" && m.rows[0].premiere_at && new Date(m.rows[0].premiere_at).getTime() > Date.now() && !(await owns(req, m.rows[0].channel_id))) return res.sendStatus(404);
   const { mime, size } = m.rows[0];
   let start = 0, end = size - 1;
   const range = req.headers.range;
@@ -221,10 +299,19 @@ app.post("/api/videos", rate("up", 20, 3600e3),
     const title = (req.body.title || f.originalname).trim().slice(0, 100);
     const desc = (req.body.desc || "").trim().slice(0, 5000);
     const thumb = /^data:image\/jpeg;base64,[A-Za-z0-9+/=]+$/.test(req.body.thumb || "") ? req.body.thumb.slice(0, 200000) : "";
-    const r = await q(`insert into videos (channel_id, title, descr, thumb, duration, mime, size, data)
-      values ($1,$2,$3,$4,$5,$6,$7,$8) returning id`,
-      [req.cid, title, desc, thumb, Number(req.body.duration) || 0, f.mimetype, f.size, f.buffer]);
-    res.json({ id: r.rows[0].id });
+    const width = Math.max(0, Math.min(100000, int(req.body.width) || 0));
+    const height = Math.max(0, Math.min(100000, int(req.body.height) || 0));
+    const duration = Math.max(0, Number(req.body.duration) || 0);
+    // Portrait video, at least 5:4 tall, and no longer than 3 minutes => Short.
+    const isShort = width > 0 && height > 0 && height / width >= 1.25 && duration <= 180;
+    const premiereAt = req.body.premiereAt ? new Date(req.body.premiereAt) : null;
+    if (premiereAt && (!Number.isFinite(premiereAt.getTime()) || premiereAt.getTime() < Date.now() + 60_000))
+      return res.status(400).json({ error: "Premiere must be scheduled at least one minute in the future." });
+    const status = premiereAt ? "scheduled" : "published";
+    const r = await q(`insert into videos (channel_id, title, descr, thumb, duration, mime, size, data, width, height, is_short, status, premiere_at)
+      values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) returning id, is_short`,
+      [req.cid, title, desc, thumb, duration, f.mimetype, f.size, f.buffer, width, height, isShort, status, premiereAt]);
+    res.json({ id: r.rows[0].id, isShort: r.rows[0].is_short, status });
   }));
 
 app.post("/api/videos/:id/view", wrap(async (req, res) => {
@@ -232,10 +319,26 @@ app.post("/api/videos/:id/view", wrap(async (req, res) => {
   res.json({ ok: true });
 }));
 
+app.post("/api/videos/:id/vote", rate("vote", 120, 60e3), wrap(async (req, res) => {
+  const id = int(req.params.id), viewer = String(req.get("x-viewer-id") || "").slice(0, 80);
+  const vote = Number(req.body.vote);
+  if (!viewer || ![1, -1, 0].includes(vote)) return res.status(400).json({ error: "A valid viewer ID and vote are required." });
+  const exists = await q("select id from videos where id=$1", [id]);
+  if (!exists.rows[0]) return notFound(res);
+  if (vote === 0) await q("delete from video_votes where video_id=$1 and viewer_id=$2", [id, viewer]);
+  else await q(`insert into video_votes (video_id, viewer_id, vote) values ($1,$2,$3)
+    on conflict (video_id, viewer_id) do update set vote=excluded.vote`, [id, viewer, vote]);
+  const totals = await q(`select count(*) filter (where vote=1)::int as likes,
+    count(*) filter (where vote=-1)::int as dislikes,
+    coalesce((select vote from video_votes where video_id=$1 and viewer_id=$2),0)::int as mine
+    from video_votes where video_id=$1`, [id, viewer]);
+  res.json(totals.rows[0]);
+}));
+
+// Backward-compatible likes endpoint for older clients.
 app.post("/api/videos/:id/like", wrap(async (req, res) => {
   const delta = req.body.delta === -1 ? -1 : 1;
-  const r = await q("update videos set likes = greatest(likes + $2, 0) where id = $1 returning likes",
-    [int(req.params.id), delta]);
+  const r = await q("update videos set likes = greatest(likes + $2, 0) where id = $1 returning likes", [int(req.params.id), delta]);
   res.json({ likes: r.rows[0] ? r.rows[0].likes : 0 });
 }));
 
@@ -351,6 +454,20 @@ app.use((err, req, res, next) => {
       size integer not null, data bytea not null, views integer not null default 0,
       likes integer not null default 0, created timestamptz not null default now());
     alter table videos add column if not exists channel_id integer references channels(id) on delete cascade;
+    alter table videos add column if not exists dislikes integer not null default 0;
+    alter table videos add column if not exists width integer not null default 0;
+    alter table videos add column if not exists height integer not null default 0;
+    alter table videos add column if not exists is_short boolean not null default false;
+    alter table videos add column if not exists status text not null default 'published';
+    alter table videos add column if not exists premiere_at timestamptz;
+    create table if not exists video_votes (
+      video_id integer not null references videos(id) on delete cascade,
+      viewer_id text not null, vote smallint not null check (vote in (-1,1)),
+      created timestamptz not null default now(), primary key (video_id, viewer_id));
+    insert into video_votes (video_id, viewer_id, vote)
+      select v.id, 'legacy-like-' || v.id || '-' || n::text, 1
+      from videos v cross join lateral generate_series(1, least(v.likes, 10000)) as gs(n)
+      where v.likes > 0 and not exists (select 1 from video_votes x where x.video_id = v.id);
     create table if not exists comments (
       id serial primary key, video_id integer not null references videos(id) on delete cascade,
       body text not null, created timestamptz not null default now());
@@ -360,6 +477,10 @@ app.use((err, req, res, next) => {
     create table if not exists playlist_items (
       playlist_id integer not null references playlists(id) on delete cascade,
       video_id integer not null references videos(id) on delete cascade,
-      pos integer not null, primary key (playlist_id, video_id));`);
+      pos integer not null, primary key (playlist_id, video_id));
+    create table if not exists live_streams (
+      channel_id integer primary key references channels(id) on delete cascade,
+      title text not null default 'Live stream', quality text not null default '1080p',
+      key_hash text not null, created timestamptz not null default now());`);
   app.listen(PORT, () => console.log(`OpenTube running on port ${PORT}`));
 })().catch((e) => { console.error("Startup failed:", e.message); process.exit(1); });

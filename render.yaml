@@ -21,3 +21,9 @@ services:
         generateValue: true  # Render creates a random secret for signing admin sessions
       - key: MAX_MB
         value: "50"
+      - key: STREAM_AUTH_SECRET
+        sync: false
+      - key: RTMP_PUBLIC_URL
+        sync: false
+      - key: HLS_PUBLIC_URL
+        sync: false

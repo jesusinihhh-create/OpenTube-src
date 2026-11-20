@@ -1,0 +1,14 @@
+# MediaMTX: OBS publishes over RTMP; viewers watch over HLS/HTTPS.
+authMethod: http
+authHTTPAddress: ${MTX_AUTH_HTTP_URL}
+
+rtmp: yes
+rtmpAddress: :1935
+
+hls: yes
+hlsAddress: :8888
+hlsAllowOrigins: ['*']
+hlsVariant: fmp4
+
+paths:
+  all_others: {}
