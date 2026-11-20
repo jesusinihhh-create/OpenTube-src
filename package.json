@@ -1,0 +1,17 @@
+{
+  "name": "opentube",
+  "version": "1.0.0",
+  "description": "Ad-free, account-free video site that stores videos in PostgreSQL",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "multer": "^1.4.5-lts.1",
+    "pg": "^8.11.5"
+  }
+}
