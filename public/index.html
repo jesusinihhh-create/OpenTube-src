@@ -4,29 +4,65 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>OpenTube</title>
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#141414" media="(prefers-color-scheme: dark)">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icon-192.png">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
 <header>
+  <button id="menu" aria-label="Menu">☰</button>
   <div class="logo" id="logo"><i>▶</i><span>OpenTube</span></div>
-  <div class="search"><input id="q" type="search" placeholder="Search videos and channels" aria-label="Search"><button id="sb">Search</button></div>
+  <div class="search"><input id="q" type="search" placeholder="Search videos and channels  ( / )" aria-label="Search"><button id="sb">Search</button></div>
+  <button id="sbm" aria-label="Search">🔍</button>
   <button class="up" id="upb">Upload</button>
   <button id="acc">Sign in</button>
   <button id="adm">Admin</button>
+  <button id="pal" aria-label="Appearance">🎨</button>
   <button id="tb" aria-label="Toggle theme">◐</button>
 </header>
 <div class="wrap">
-  <nav>
-    <a data-go="home">Home</a><a data-go="subs">Subscriptions</a><a data-go="channels">Channels</a>
-    <a data-go="playlists">Playlists</a><a data-go="liked">Liked videos</a><a data-go="history">History</a>
-    <a data-go="admin" id="navadmin" hidden>Admin panel</a>
+  <nav aria-label="Sections">
+    <a data-go="home"><i>🏠</i><span>Home</span></a>
+    <a data-go="shorts"><i>⚡</i><span>Shorts</span></a>
+    <a data-go="trending"><i>🔥</i><span>Trending</span></a>
+    <a data-go="premieres"><i>🎬</i><span>Premieres</span></a>
+    <a data-go="subs"><i>📺</i><span>Subscriptions</span></a>
+    <a data-go="channels"><i>👥</i><span>Channels</span></a>
+    <a data-go="playlists"><i>📚</i><span>Playlists</span></a>
+    <a data-go="saved"><i>🔖</i><span>Watch later</span></a>
+    <a data-go="live"><i>🔴</i><span>Live</span></a>
+    <a data-go="liked"><i>👍</i><span>Liked</span></a>
+    <a data-go="history"><i>🕘</i><span>History</span></a>
+    <a data-go="admin" id="navadmin" hidden><i>🛡</i><span>Admin panel</span></a>
+    <hr>
+    <a data-go="settings"><i>⚙️</i><span>Settings</span></a>
+    <a data-act="pal"><i>🎨</i><span>Appearance</span></a>
+    <a data-act="adm" class="onlyphone"><i>🛡</i><span>Admin login</span></a>
   </nav>
   <main>
     <div class="chips" id="chips"></div>
     <div id="view"></div>
   </main>
 </div>
+<div id="scrim"></div>
+<div class="tabbar" aria-label="Main">
+  <a data-go="home"><i>🏠</i>Home</a>
+  <a data-go="shorts"><i>⚡</i>Shorts</a>
+  <a data-up class="plus"><i>＋</i>Upload</a>
+  <a data-go="subs"><i>📺</i>Subs</a>
+  <a data-act="menu"><i>☰</i>More</a>
+</div>
 <dialog id="m"></dialog>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
 <script src="app.js"></script>
+<script src="ui.js"></script>
+<script src="settings.js"></script>
+<script src="extras.js"></script>
 </body>
 </html>
