@@ -1,6 +1,6 @@
 name: Build apps (Windows .exe and Android .apk)
 
-on:
+'on':
   workflow_dispatch:
     inputs:
       site_url:
