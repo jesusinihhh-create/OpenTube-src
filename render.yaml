@@ -19,5 +19,7 @@ services:
         sync: false          # you type this in the Render dashboard. It is never stored in this repo.
       - key: SESSION_SECRET
         generateValue: true  # Render creates a random secret for signing admin sessions
+      - key: APPS_URL
+        sync: false          # optional: link to your GitHub Releases page, shown as Settings > Get the apps
       - key: MAX_MB
-        value: "50000000000000000000000000000000000000000000000000000"
+        value: "50"

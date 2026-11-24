@@ -1,6 +1,6 @@
 {
   "name": "opentube",
-  "version": "1.0.0",
+  "version": "8.0.0",
   "description": "Ad-free, account-free video site that stores videos in PostgreSQL",
   "main": "server.js",
   "scripts": {
