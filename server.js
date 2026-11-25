@@ -6,6 +6,7 @@ const crypto = require("crypto");
 
 const PORT = process.env.PORT || 3000;
 const MAX_MB = Number(process.env.MAX_MB || 50);
+const SSH101_RTMP_URL = "rtmp://ssh101.bozztv.com/ssh101";
 const CHUNK = 4 * 1024 * 1024;
 
 if (!process.env.DATABASE_URL) {
@@ -69,7 +70,7 @@ app.use((req, res, next) => {
     "X-Frame-Options": "DENY",
     "Referrer-Policy": "no-referrer",
     "Content-Security-Policy":
-      "default-src 'self'; img-src 'self' data:; media-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+      "default-src 'self'; img-src 'self' data:; media-src 'self' blob: https:; connect-src 'self' https:; style-src 'self' 'unsafe-inline'; script-src 'self' https://cdn.jsdelivr.net; worker-src blob:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
   });
   next();
 });
@@ -88,8 +89,8 @@ async function owns(req, cid) {
 const needAdmin = (req, res, next) => (isAdmin(req) ? next() : forbid(res));
 
 /* ---------- config + admin ---------- */
-app.get("/api/config", (req, res) =>
-  res.json({ maxMb: MAX_MB, admin: isAdmin(req), adminEnabled: !!ADMIN }));
+app.get("/api/config", wrap(async (req, res) =>
+  res.json({ announcement: await setting("announcement"), lockSignup: (await setting("lock_signup")) === "1", maxMb: MAX_MB, admin: isAdmin(req), adminEnabled: !!ADMIN, liveConfigured: true, liveProvider: "ssh101", rtmpUrl: SSH101_RTMP_URL, appsUrl: /^https:\/\//.test(process.env.APPS_URL || "") ? process.env.APPS_URL : "" })));
 
 app.post("/api/admin/login", rate("login", 8, 15 * 60e3), (req, res) => {
   if (!ADMIN) return res.status(503).json({ error: "Admin is not set up on this server." });
@@ -113,13 +114,15 @@ app.get("/api/admin/stats", needAdmin, wrap(async (req, res) => {
 
 /* ---------- channels ---------- */
 app.get("/api/channels", wrap(async (req, res) => {
-  const r = await q(`select c.id, c.name, c.descr,
-    (select count(*) from videos v where v.channel_id = c.id)::int as vcount
-    from channels c order by vcount desc, c.created desc`);
-  res.json(r.rows);
+  const r = await q(`select c.id, c.name, c.descr, c.emoji, c.color,
+    (select count(*) from videos v where v.channel_id = c.id and v.visibility = 'public')::int as vcount
+    from channels c ${isAdmin(req) ? "" : "where not c.suspended"} order by vcount desc, c.created desc`);
+  const on = new Set((await liveRows()).filter((x) => x.live).map((x) => x.channel_id));
+  res.json(r.rows.map((x) => ({ ...x, live: on.has(x.id) })));
 }));
 
 app.post("/api/channels", rate("mk", 10, 3600e3), wrap(async (req, res) => {
+  if (!isAdmin(req) && (await setting("lock_signup")) === "1") return res.status(403).json({ error: "New channels are closed right now." });
   const name = String(req.body.name || "").trim().slice(0, 40);
   const descr = String(req.body.descr || "").trim().slice(0, 500);
   if (name.length < 2) return res.status(400).json({ error: "Channel name needs at least 2 characters." });
@@ -143,13 +146,90 @@ app.post("/api/channels/login", rate("ck", 20, 15 * 60e3), wrap(async (req, res)
 
 app.get("/api/channels/:id", wrap(async (req, res) => {
   const id = int(req.params.id);
-  const c = await q("select id, name, descr from channels where id = $1", [id]);
+  const c = await q(`select id, name, descr, emoji, color, (extract(epoch from created) * 1000)::float8 as created,
+    (select count(*) from channel_subscriptions s where s.channel_id=channels.id)::int as subscribers,
+    exists(select 1 from channel_subscriptions s where s.channel_id=channels.id and s.viewer_id=$2) as subscribed
+    from channels where id = $1`, [id, String(req.get("x-viewer-id") || "").slice(0,80)]);
   if (!c.rows[0]) return notFound(res);
   const p = await q(`select p.id, p.title, p.descr, p.channel_id,
     (select count(*) from playlist_items i where i.playlist_id = p.id)::int as count,
     (select v.thumb from playlist_items i join videos v on v.id = i.video_id where i.playlist_id = p.id order by i.pos limit 1) as thumb
     from playlists p where p.channel_id = $1 order by p.created desc`, [id]);
-  res.json({ ...c.rows[0], playlists: p.rows });
+  const sr = (await liveRows()).find((x) => x.channel_id === id);
+  res.json({ ...c.rows[0], playlists: p.rows, stream: sr ? { title: sr.title, quality: sr.quality, live: sr.live, viewers: sr.viewers } : null });
+}));
+
+app.post("/api/channels/:id/subscribe", rate("subscribe", 120, 60e3), wrap(async (req, res) => {
+  const cid = int(req.params.id), viewer = String(req.get("x-viewer-id") || "").slice(0,80);
+  if (!viewer) return res.status(400).json({ error: "Viewer ID required." });
+  const exists = await q("select id from channels where id=$1", [cid]);
+  if (!exists.rows[0]) return notFound(res);
+  if (req.body.subscribed) await q(`insert into channel_subscriptions(channel_id,viewer_id) values($1,$2) on conflict do nothing`, [cid, viewer]);
+  else await q("delete from channel_subscriptions where channel_id=$1 and viewer_id=$2", [cid, viewer]);
+  const r = await q("select count(*)::int as subscribers from channel_subscriptions where channel_id=$1", [cid]);
+  res.json({ subscribed: !!req.body.subscribed, subscribers: r.rows[0].subscribers });
+}));
+
+const VIS = ["public", "unlisted", "private"];
+const ownerSig = (id, e) => crypto.createHmac("sha256", SECRET).update("v" + id + "." + e).digest("hex");
+const ownerToken = (id) => { const e = Date.now() + 6 * 3600e3; return e + "." + ownerSig(id, e); };
+const validOwnerToken = (id, t) => { const [e, s] = String(t || "").split("."); return !!e && !!s && Number(e) > Date.now() && same(Buffer.from(s), Buffer.from(ownerSig(id, e))); };
+// Public: everyone. Unlisted: anyone with the share key. Private: owner or admin only. Suspended channels: owner or admin only.
+async function canSee(req, v, id) {
+  if (validOwnerToken(id, req.query.t) || (await owns(req, v.channel_id))) return true;
+  if (v.susp) return false;
+  if (v.visibility === "public") return true;
+  return v.visibility === "unlisted" && !!v.share_key && !!req.query.k && same(Buffer.from(String(req.query.k)), Buffer.from(v.share_key));
+}
+async function audit(action, detail) { try { await q("insert into audit_log (action, detail) values ($1,$2)", [action, String(detail).slice(0, 300)]); } catch (e) {} }
+async function setting(key) { const r = await q("select value from site_settings where key = $1", [key]); return r.rows[0] ? r.rows[0].value : ""; }
+const putSetting = (key, value) => q("insert into site_settings (key, value) values ($1,$2) on conflict (key) do update set value = excluded.value", [key, String(value)]);
+
+const CATS = ["gaming", "music", "learning", "tech", "sports", "fun", "news", "other"];
+const cleanEmoji = (s) => Array.from(String(s || "").trim()).slice(0, 2).join("");
+
+app.patch("/api/channels/:id", rate("ed", 30, 3600e3), wrap(async (req, res) => {
+  const id = int(req.params.id);
+  if (!(await owns(req, id))) return forbid(res);
+  const name = String(req.body.name || "").trim().slice(0, 40);
+  if (name.length < 2) return res.status(400).json({ error: "Channel name needs at least 2 characters." });
+  const descr = String(req.body.descr || "").trim().slice(0, 500);
+  const emoji = cleanEmoji(req.body.emoji);
+  const color = /^#[0-9a-fA-F]{6}$/.test(req.body.color || "") ? req.body.color.toLowerCase() : "";
+  try {
+    const r = await q("update channels set name=$2, descr=$3, emoji=$4, color=$5 where id=$1 returning id", [id, name, descr, emoji, color]);
+    if (!r.rows[0]) return notFound(res);
+    res.json({ ok: true, name, descr, emoji, color });
+  } catch (e) {
+    if (e.code === "23505") return res.status(409).json({ error: "That channel name is taken." });
+    throw e;
+  }
+}));
+
+// Rotating the key makes the old one stop working immediately. The new key is shown once.
+app.post("/api/channels/:id/key", rate("rk", 5, 3600e3), wrap(async (req, res) => {
+  const id = int(req.params.id);
+  if (!(await owns(req, id))) return forbid(res);
+  const key = crypto.randomBytes(24).toString("hex");
+  await q("update channels set key_hash=$2 where id=$1", [id, sha(key).toString("hex")]);
+  res.json({ key });
+}));
+
+app.patch("/api/videos/:id", wrap(async (req, res) => {
+  const id = int(req.params.id);
+  const v = await q("select channel_id from videos where id = $1", [id]);
+  if (!v.rows[0]) return notFound(res);
+  if (!(await owns(req, v.rows[0].channel_id))) return forbid(res);
+  const title = String(req.body.title || "").trim().slice(0, 100);
+  if (!title) return res.status(400).json({ error: "Title can’t be empty." });
+  const category = CATS.includes(req.body.category) ? req.body.category : "";
+  const sets = ["title=$2", "descr=$3", "category=$4"], args = [id, title, String(req.body.desc || "").trim().slice(0, 5000), category];
+  if (VIS.includes(req.body.visibility)) { args.push(req.body.visibility); sets.push(`visibility=$${args.length}`); }
+  if (AUD.includes(req.body.audience)) { args.push(req.body.audience); sets.push(`audience=$${args.length}`); }
+  if (req.body.resetKey) { args.push(crypto.randomBytes(8).toString("hex")); sets.push(`share_key=$${args.length}`); }
+  await q(`update videos set ${sets.join(", ")} where id=$1`, args);
+  const now = await q("select visibility, share_key from videos where id = $1", [id]);
+  res.json({ ok: true, ...now.rows[0] });
 }));
 
 app.delete("/api/channels/:id", wrap(async (req, res) => {
@@ -159,33 +239,158 @@ app.delete("/api/channels/:id", wrap(async (req, res) => {
   res.json({ ok: true });
 }));
 
+/* ---------- live streaming (free SSH101 RTMP ingest + HLS playback) ---------- */
+const liveKeyHash = (v) => sha(String(v || "")).toString("hex");
+function validSsh101Hls(value) {
+  try {
+    const u = new URL(String(value || ""));
+    const host = u.hostname.toLowerCase();
+    return u.protocol === "https:" && (host === "ssh101.com" || host.endsWith(".ssh101.com") || host.endsWith(".giatvcdn.com") || host.endsWith(".bozztv.com")) && u.pathname.endsWith(".m3u8");
+  } catch { return false; }
+}
+// A channel is "on air" only when its SSH101 HLS playlist is actually being served and has not ended.
+// Results are cached for 20 seconds per channel so viewers never hammer the CDN.
+const liveCache = new Map();
+const hlsHostOk = (h) => h === "ssh101.com" || h.endsWith(".ssh101.com") || h.endsWith(".giatvcdn.com") || h.endsWith(".bozztv.com");
+async function probeHls(url) {
+  try {
+    const r = await fetch(url, { signal: AbortSignal.timeout(4000), headers: { "User-Agent": "OpenTube-LiveCheck" } });
+    if (!r.ok || !hlsHostOk(new URL(r.url).hostname.toLowerCase())) return false;
+    const t = (await r.text()).slice(0, 200000);
+    return t.trimStart().startsWith("#EXTM3U") && !t.includes("#EXT-X-ENDLIST");
+  } catch { return false; }
+}
+async function liveRows() {
+  const r = await q(`select l.channel_id, l.title, l.quality, l.playback_url, c.name as channel,
+    (select count(*) from channel_subscriptions s where s.channel_id=l.channel_id)::int as subscribers,
+    (select count(*) from live_presence p where p.channel_id=l.channel_id and p.seen>now()-interval '60 seconds')::int as viewers,
+    (extract(epoch from l.created) * 1000)::float8 as date
+    from live_streams l join channels c on c.id = l.channel_id`);
+  const now = Date.now();
+  await Promise.all(r.rows.map(async (row) => {
+    let e = liveCache.get(row.channel_id);
+    if (!e || e.url !== row.playback_url || now - e.t > 20000) { e = { t: now, url: row.playback_url, p: probeHls(row.playback_url) }; liveCache.set(row.channel_id, e); }
+    row.live = await e.p;
+  }));
+  return r.rows.sort((a, b) => Number(b.live) - Number(a.live) || b.viewers - a.viewers || b.date - a.date);
+}
+app.get("/api/live", wrap(async (req, res) => res.json(await liveRows())));
+app.get("/api/live/status", wrap(async (req, res) => {
+  const on = (await liveRows()).filter((x) => x.live);
+  res.json({ ids: on.map((x) => x.channel_id), names: Object.fromEntries(on.map((x) => [x.channel_id, x.channel])), viewers: Object.fromEntries(on.map((x) => [x.channel_id, x.viewers])) });
+}));
+app.get("/api/live/mine", wrap(async (req, res) => {
+  const cid = int(req.get("x-channel-id"));
+  if (!cid || !(await owns(req, cid))) return forbid(res);
+  const r = await q("select channel_id, title, quality, provider_uid as stream_name, playback_url from live_streams where channel_id = $1", [cid]);
+  res.json(r.rows[0] || null);
+}));
+async function provisionLive(req, res) {
+  const cid = int(req.get("x-channel-id"));
+  if (!cid || !(await owns(req, cid))) return forbid(res);
+  const title = String(req.body.title || "Live stream").trim().slice(0, 100) || "Live stream";
+  const quality = ["480p", "720p", "1080p"].includes(req.body.quality) ? req.body.quality : "720p";
+  const streamName = String(req.body.streamName || "").trim();
+  const playbackUrl = String(req.body.playbackUrl || "").trim();
+  if (!/^[a-zA-Z0-9_-]{3,100}$/.test(streamName)) return res.status(400).json({ error: "Enter the SSH101 Streaming Publishing Point / channel key (3–100 letters, numbers, _ or -)." });
+  if (!validSsh101Hls(playbackUrl)) return res.status(400).json({ error: "Paste the HTTPS HLS (.m3u8) URL supplied by SSH101. It must use an SSH101 / Giatv CDN host." });
+  await q(`insert into live_streams (channel_id,title,quality,key_hash,provider,provider_uid,playback_url,ingest_url)
+    values ($1,$2,$3,$4,'ssh101',$5,$6,$7) on conflict(channel_id) do update set title=excluded.title,quality=excluded.quality,key_hash=excluded.key_hash,provider='ssh101',provider_uid=excluded.provider_uid,playback_url=excluded.playback_url,ingest_url=excluded.ingest_url,created=now()`,
+    [cid,title,quality,liveKeyHash(streamName),streamName,playbackUrl,SSH101_RTMP_URL]);
+  res.json({ ok:true, channelId:cid, title, quality, rtmpUrl:SSH101_RTMP_URL, streamKey:streamName, watchUrl:playbackUrl });
+}
+app.post("/api/live", rate("live", 10, 3600e3), wrap(provisionLive));
+app.post("/api/live/rotate", wrap(async (req,res) => {
+  const cid = int(req.get("x-channel-id")); if (!cid || !(await owns(req,cid))) return forbid(res);
+  const r = await q("select title,quality,provider_uid as stream_name,playback_url from live_streams where channel_id=$1",[cid]);
+  if (!r.rows[0]) return notFound(res);
+  res.json({ rtmpUrl:SSH101_RTMP_URL, streamKey:r.rows[0].stream_name, watchUrl:r.rows[0].playback_url, title:r.rows[0].title, quality:r.rows[0].quality });
+}));
+app.delete("/api/live", wrap(async (req,res)=>{
+  const cid=int(req.get("x-channel-id")); if(!cid || !(await owns(req,cid))) return forbid(res);
+  await q("delete from live_streams where channel_id=$1",[cid]);
+  res.json({ok:true});
+}));
+app.get("/api/live/:id/chat", wrap(async (req,res)=>{
+  const cid=int(req.params.id), after=Math.max(0,int(req.query.after)||0);
+  const exists=await q("select 1 from live_streams where channel_id=$1",[cid]); if(!exists.rows[0]) return notFound(res);
+  const r=await q("select id,nickname,body,(extract(epoch from created)*1000)::float8 as date from live_chat where channel_id=$1 and id>$2 order by id asc limit 100",[cid,after]);
+  const count=await q("select count(distinct viewer_id)::int as viewers from live_presence where channel_id=$1 and seen>now()-interval '60 seconds'",[cid]);
+  res.json({messages:r.rows,viewers:count.rows[0].viewers});
+}));
+app.post("/api/live/:id/chat/presence", rate("livepresence",30,60e3), wrap(async(req,res)=>{
+  const cid=int(req.params.id), viewer=String(req.get("x-viewer-id")||"").slice(0,100);
+  if(!viewer) return res.status(400).json({error:"Viewer ID is required."});
+  const exists=await q("select 1 from live_streams where channel_id=$1",[cid]); if(!exists.rows[0]) return notFound(res);
+  await q("insert into live_presence(channel_id,viewer_id,seen) values($1,$2,now()) on conflict(channel_id,viewer_id) do update set seen=now()",[cid,viewer]);
+  await q("delete from live_presence where seen < now()-interval '1 day'");
+  const count=await q("select count(*)::int as viewers from live_presence where channel_id=$1 and seen>now()-interval '60 seconds'",[cid]);
+  res.json({viewers:count.rows[0].viewers});
+}));
+app.post("/api/live/:id/chat", rate("livechat",20,60e3), wrap(async(req,res)=>{
+  const cid=int(req.params.id), viewer=String(req.get("x-viewer-id")||"").slice(0,100);
+  if(!viewer) return res.status(400).json({error:"Viewer ID is required."});
+  const exists=await q("select 1 from live_streams where channel_id=$1",[cid]); if(!exists.rows[0]) return notFound(res);
+  const nickname=String(req.body.nickname||"Guest").trim().slice(0,32)||"Guest", body=String(req.body.body||"").trim().slice(0,500);
+  if(!body) return res.status(400).json({error:"Write a message first."});
+  const r=await q("insert into live_chat(channel_id,viewer_id,nickname,body) values($1,$2,$3,$4) returning id,nickname,body,(extract(epoch from created)*1000)::float8 as date",[cid,viewer,nickname,body]);
+  res.json(r.rows[0]);
+}));
+
 /* ---------- videos ---------- */
 app.get("/api/videos", wrap(async (req, res) => {
   const ch = /^\d+$/.test(req.query.channel || "") ? int(req.query.channel) : null;
+  const type = String(req.query.type || "");
+  const params = [];
+  const where = [];
+  if (ch) { params.push(ch); where.push(`v.channel_id = $${params.length}`); }
+  if (type === "shorts") where.push("v.is_short = true");
+  const cat = String(req.query.category || "");
+  if (cat && CATS.includes(cat)) { params.push(cat); where.push(`v.category = $${params.length}`); }
+  if (!(ch && await owns(req, ch))) where.push("v.visibility = 'public' and not coalesce(c.suspended, false)");
+  if (type === "premieres") where.push("v.status = 'scheduled' and v.premiere_at > now()");
+  else if (!(ch && await owns(req, ch))) where.push("(v.status <> 'scheduled' or v.premiere_at <= now())");
   const r = await q(`
-    select v.id, v.title, v.descr as "desc", v.thumb, v.duration, v.views, v.likes, v.channel_id, c.name as channel,
-           (extract(epoch from v.created) * 1000)::float8 as date
+    select v.id, v.title, v.descr as "desc", v.thumb, v.duration, v.views, v.likes, v.dislikes,
+      v.is_short, v.category, v.visibility, v.audience, (select count(*) from comments cm where cm.video_id = v.id)::int as ccount, v.status, (extract(epoch from v.premiere_at) * 1000)::float8 as premiere_at,
+      v.channel_id, c.name as channel,
+      (select count(*) from channel_subscriptions s where s.channel_id=v.channel_id)::int as subscribers,
+      (extract(epoch from v.created) * 1000)::float8 as date
     from videos v left join channels c on c.id = v.channel_id
-    ${ch ? "where v.channel_id = $1" : ""} order by v.created desc`, ch ? [ch] : []);
+    ${where.length ? "where " + where.join(" and ") : ""} order by coalesce(v.premiere_at, v.created) desc`, params);
   res.json(r.rows);
 }));
 
 app.get("/api/videos/:id", wrap(async (req, res) => {
   const id = int(req.params.id);
   const r = await q(`
-    select v.id, v.title, v.descr as "desc", v.duration, v.views, v.likes, v.channel_id, c.name as channel,
-           (extract(epoch from v.created) * 1000)::float8 as date
+    select v.id, v.title, v.descr as "desc", v.thumb, v.duration, v.views, v.likes, v.dislikes,
+      v.is_short, v.category, v.visibility, v.audience, (select count(*) from comments cm where cm.video_id = v.id)::int as ccount, v.status, (extract(epoch from v.premiere_at) * 1000)::float8 as premiere_at,
+      v.channel_id, c.name as channel,
+      (select count(*) from channel_subscriptions s where s.channel_id=v.channel_id)::int as subscribers,
+      (extract(epoch from v.created) * 1000)::float8 as date
     from videos v left join channels c on c.id = v.channel_id where v.id = $1`, [id]);
   if (!r.rows[0]) return notFound(res);
+  const gate = await q("select v.share_key, c.suspended as susp from videos v left join channels c on c.id = v.channel_id where v.id = $1", [id]);
+  const row0 = { ...r.rows[0], ...gate.rows[0] };
+  if (!(await canSee(req, row0, id))) return notFound(res);
+  const own = await owns(req, row0.channel_id);
   const cm = await q(`select id, body as x, (extract(epoch from created) * 1000)::float8 as t
     from comments where video_id = $1 order by created desc`, [id]);
-  res.json({ ...r.rows[0], comments: cm.rows });
+  const viewer = String(req.get("x-viewer-id") || "").slice(0, 80);
+  const votes = viewer ? await q(`select count(*) filter (where vote=1)::int as likes,
+    count(*) filter (where vote=-1)::int as dislikes,
+    coalesce((select vote from video_votes where video_id=$1 and viewer_id=$2),0)::int as my_vote
+    from video_votes where video_id=$1`, [id, viewer]) : { rows: [{ likes: 0, dislikes: 0, my_vote: 0 }] };
+  res.json({ ...r.rows[0], share_key: own ? row0.share_key : undefined, token: own ? ownerToken(id) : undefined, vote_counts: votes.rows[0], comments: cm.rows });
 }));
 
 app.get("/api/videos/:id/stream", wrap(async (req, res) => {
   const id = int(req.params.id);
-  const m = await q("select mime, size from videos where id = $1", [id]);
+  const m = await q("select mime, size, channel_id, status, premiere_at, visibility, share_key, (select suspended from channels where id = videos.channel_id) as susp from videos where id = $1", [id]);
   if (!m.rows[0]) return res.sendStatus(404);
+  if (m.rows[0].status === "scheduled" && m.rows[0].premiere_at && new Date(m.rows[0].premiere_at).getTime() > Date.now() && !(await owns(req, m.rows[0].channel_id))) return res.sendStatus(404);
+  if (!(await canSee(req, m.rows[0], id))) return res.sendStatus(404);
   const { mime, size } = m.rows[0];
   let start = 0, end = size - 1;
   const range = req.headers.range;
@@ -212,6 +417,8 @@ app.post("/api/videos", rate("up", 20, 3600e3),
   wrap(async (req, res, next) => {
     req.cid = int(req.get("x-channel-id"));
     if (!req.cid || !(await owns(req, req.cid))) return forbid(res);
+    const susp = await q("select suspended from channels where id = $1", [req.cid]);
+    if (susp.rows[0] && susp.rows[0].suspended && !isAdmin(req)) return res.status(403).json({ error: "This channel is suspended." });
     next();
   }),
   upload.single("file"),
@@ -221,10 +428,23 @@ app.post("/api/videos", rate("up", 20, 3600e3),
     const title = (req.body.title || f.originalname).trim().slice(0, 100);
     const desc = (req.body.desc || "").trim().slice(0, 5000);
     const thumb = /^data:image\/jpeg;base64,[A-Za-z0-9+/=]+$/.test(req.body.thumb || "") ? req.body.thumb.slice(0, 200000) : "";
-    const r = await q(`insert into videos (channel_id, title, descr, thumb, duration, mime, size, data)
-      values ($1,$2,$3,$4,$5,$6,$7,$8) returning id`,
-      [req.cid, title, desc, thumb, Number(req.body.duration) || 0, f.mimetype, f.size, f.buffer]);
-    res.json({ id: r.rows[0].id });
+    const width = Math.max(0, Math.min(100000, int(req.body.width) || 0));
+    const height = Math.max(0, Math.min(100000, int(req.body.height) || 0));
+    const duration = Math.max(0, Number(req.body.duration) || 0);
+    // Portrait video, at least 5:4 tall, and no longer than 3 minutes => Short.
+    const isShort = width > 0 && height > 0 && height / width >= 1.25 && duration <= 180;
+    const premiereAt = req.body.premiereAt ? new Date(req.body.premiereAt) : null;
+    if (premiereAt && (!Number.isFinite(premiereAt.getTime()) || premiereAt.getTime() < Date.now() + 60_000))
+      return res.status(400).json({ error: "Premiere must be scheduled at least one minute in the future." });
+    const category = CATS.includes(req.body.category) ? req.body.category : "";
+    const visibility = VIS.includes(req.body.visibility) ? req.body.visibility : "public";
+    const audience = AUD.includes(req.body.audience) ? req.body.audience : "general";
+    const shareKey = crypto.randomBytes(8).toString("hex");
+    const status = premiereAt ? "scheduled" : "published";
+    const r = await q(`insert into videos (channel_id, title, descr, thumb, duration, mime, size, data, width, height, is_short, status, premiere_at, category, visibility, share_key, audience)
+      values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) returning id, is_short`,
+      [req.cid, title, desc, thumb, duration, f.mimetype, f.size, f.buffer, width, height, isShort, status, premiereAt, category, visibility, shareKey, audience]);
+    res.json({ id: r.rows[0].id, isShort: r.rows[0].is_short, status, visibility, shareKey });
   }));
 
 app.post("/api/videos/:id/view", wrap(async (req, res) => {
@@ -232,10 +452,26 @@ app.post("/api/videos/:id/view", wrap(async (req, res) => {
   res.json({ ok: true });
 }));
 
+app.post("/api/videos/:id/vote", rate("vote", 120, 60e3), wrap(async (req, res) => {
+  const id = int(req.params.id), viewer = String(req.get("x-viewer-id") || "").slice(0, 80);
+  const vote = Number(req.body.vote);
+  if (!viewer || ![1, -1, 0].includes(vote)) return res.status(400).json({ error: "A valid viewer ID and vote are required." });
+  const exists = await q("select id from videos where id=$1", [id]);
+  if (!exists.rows[0]) return notFound(res);
+  if (vote === 0) await q("delete from video_votes where video_id=$1 and viewer_id=$2", [id, viewer]);
+  else await q(`insert into video_votes (video_id, viewer_id, vote) values ($1,$2,$3)
+    on conflict (video_id, viewer_id) do update set vote=excluded.vote`, [id, viewer, vote]);
+  const totals = await q(`select count(*) filter (where vote=1)::int as likes,
+    count(*) filter (where vote=-1)::int as dislikes,
+    coalesce((select vote from video_votes where video_id=$1 and viewer_id=$2),0)::int as mine
+    from video_votes where video_id=$1`, [id, viewer]);
+  res.json(totals.rows[0]);
+}));
+
+// Backward-compatible likes endpoint for older clients.
 app.post("/api/videos/:id/like", wrap(async (req, res) => {
   const delta = req.body.delta === -1 ? -1 : 1;
-  const r = await q("update videos set likes = greatest(likes + $2, 0) where id = $1 returning likes",
-    [int(req.params.id), delta]);
+  const r = await q("update videos set likes = greatest(likes + $2, 0) where id = $1 returning likes", [int(req.params.id), delta]);
   res.json({ likes: r.rows[0] ? r.rows[0].likes : 0 });
 }));
 
@@ -248,20 +484,65 @@ app.delete("/api/videos/:id", wrap(async (req, res) => {
   res.json({ ok: true });
 }));
 
+/* ---------- viewer saved videos / Watch later ---------- */
+app.get("/api/saved", wrap(async (req, res) => {
+  const viewer = String(req.get("x-viewer-id") || "").slice(0,80);
+  if (!viewer) return res.json([]);
+  const r = await q(`select v.id, v.title, v.thumb, v.duration, v.views, v.likes, v.dislikes, v.is_short,
+    v.status, (extract(epoch from v.premiere_at)*1000)::float8 as premiere_at, v.channel_id,
+    c.name as channel, (extract(epoch from v.created)*1000)::float8 as date
+    from saved_videos s join videos v on v.id=s.video_id left join channels c on c.id=v.channel_id
+    where s.viewer_id=$1 and v.visibility <> 'private' and not coalesce(c.suspended,false) and (v.status <> 'scheduled' or v.premiere_at <= now()) order by s.created desc`, [viewer]);
+  res.json(r.rows);
+}));
+app.post("/api/saved/:id", wrap(async (req, res) => {
+  const viewer = String(req.get("x-viewer-id") || "").slice(0,80), id=int(req.params.id);
+  if (!viewer) return res.status(400).json({ error: "Viewer ID required." });
+  const v=await q("select id from videos where id=$1",[id]); if(!v.rows[0]) return notFound(res);
+  await q("insert into saved_videos(viewer_id,video_id) values($1,$2) on conflict do nothing",[viewer,id]);
+  res.json({ ok:true });
+}));
+app.delete("/api/saved/:id", wrap(async (req, res) => {
+  const viewer=String(req.get("x-viewer-id")||"").slice(0,80);
+  await q("delete from saved_videos where viewer_id=$1 and video_id=$2",[viewer,int(req.params.id)]);
+  res.json({ ok:true });
+}));
+
+/* ---------- Premiere live chat ---------- */
+app.get("/api/videos/:id/premiere-chat", wrap(async (req,res)=>{
+  const id=int(req.params.id), after=Math.max(0,int(req.query.after)||0);
+  const v=await q("select id,status,premiere_at from videos where id=$1",[id]); if(!v.rows[0]) return notFound(res);
+  const r=await q(`select id, nickname, body, (extract(epoch from created)*1000)::float8 as t
+    from premiere_chat where video_id=$1 and id>$2 order by id asc limit 100`,[id,after]);
+  res.json(r.rows);
+}));
+app.post("/api/videos/:id/premiere-chat", rate("pchat",30,60e3), wrap(async(req,res)=>{
+  const id=int(req.params.id), viewer=String(req.get("x-viewer-id")||"").slice(0,80);
+  const body=String(req.body.body||"").trim().slice(0,240), nickname=String(req.body.nickname||"Guest").trim().slice(0,32)||"Guest";
+  if(!viewer||!body) return res.status(400).json({error:"Write a message first."});
+  const v=await q("select id,status,premiere_at from videos where id=$1",[id]); if(!v.rows[0]) return notFound(res);
+  if(v.rows[0].status!="scheduled") return res.status(400).json({error:"Live chat is only for premieres."});
+  const r=await q(`insert into premiere_chat(video_id,viewer_id,nickname,body) values($1,$2,$3,$4)
+    returning id,nickname,body,(extract(epoch from created)*1000)::float8 as t`,[id,viewer,nickname,body]);
+  res.json(r.rows[0]);
+}));
+
 /* ---------- comments ---------- */
 app.post("/api/videos/:id/comments", rate("cm", 30, 600e3), wrap(async (req, res) => {
   const body = String(req.body.body || "").trim().slice(0, 300);
   if (!body) return res.status(400).json({ error: "Comment is empty." });
+  const au = await q("select audience from videos where id = $1", [int(req.params.id)]);
+  if (au.rows[0] && au.rows[0].audience === "kids") return res.status(403).json({ error: KIDS_OFF });
   await q("insert into comments (video_id, body) values ($1,$2)", [int(req.params.id), body]);
   res.json({ ok: true });
 }));
 
 // Admin, or the owner of the video’s channel, can remove a comment
 app.delete("/api/comments/:id", wrap(async (req, res) => {
-  const r = await q(`select v.channel_id from comments c join videos v on v.id = c.video_id where c.id = $1`,
+  const r = await q(`select v.channel_id, c.channel_id as author_ch from comments c join videos v on v.id = c.video_id where c.id = $1`,
     [int(req.params.id)]);
   if (!r.rows[0]) return notFound(res);
-  if (!(await owns(req, r.rows[0].channel_id))) return forbid(res);
+  if (!(await owns(req, r.rows[0].channel_id)) && !(r.rows[0].author_ch && (await owns(req, r.rows[0].author_ch)))) return forbid(res);
   await q("delete from comments where id = $1", [int(req.params.id)]);
   res.json({ ok: true });
 }));
@@ -285,7 +566,7 @@ app.get("/api/playlists/:id", wrap(async (req, res) => {
   const v = await q(`select v.id, v.title, v.thumb, v.duration, v.views, v.channel_id, c.name as channel,
       (extract(epoch from v.created) * 1000)::float8 as date
     from playlist_items i join videos v on v.id = i.video_id left join channels c on c.id = v.channel_id
-    where i.playlist_id = $1 order by i.pos`, [id]);
+    where i.playlist_id = $1 and v.visibility <> 'private' order by i.pos`, [id]);
   res.json({ ...p.rows[0], videos: v.rows });
 }));
 
@@ -330,6 +611,187 @@ app.delete("/api/playlists/:id", wrap(async (req, res) => {
   res.json({ ok: true });
 }));
 
+/* ---------- audience, threaded comments, community posts ---------- */
+const AUD = ["general", "kids", "adult"];
+async function videoGate(req, id) {
+  const r = await q("select v.channel_id, v.visibility, v.share_key, v.audience, c.suspended as susp from videos v left join channels c on c.id = v.channel_id where v.id = $1", [id]);
+  const v = r.rows[0];
+  return v && (await canSee(req, v, id)) ? v : null;
+}
+const KIDS_OFF = "Comments are turned off for videos made for kids.";
+
+app.get("/api/videos/:id/thread", wrap(async (req, res) => {
+  const id = int(req.params.id), v = await videoGate(req, id);
+  if (!v) return notFound(res);
+  if (v.audience === "kids") return res.json({ disabled: true, comments: [] });
+  const r = await q(`select c.id, c.body, c.likes, c.pinned, c.parent_id, c.channel_id, ch.name as author,
+      (extract(epoch from c.created) * 1000)::float8 as t
+    from comments c left join channels ch on ch.id = c.channel_id where c.video_id = $1 order by c.created asc limit 500`, [id]);
+  res.json({ disabled: false, comments: r.rows });
+}));
+
+app.post("/api/videos/:id/thread", rate("cm", 30, 600e3), wrap(async (req, res) => {
+  const id = int(req.params.id), v = await videoGate(req, id);
+  if (!v) return notFound(res);
+  if (v.audience === "kids") return res.status(403).json({ error: KIDS_OFF });
+  const body = String(req.body.body || "").trim().slice(0, 300);
+  if (!body) return res.status(400).json({ error: "Comment is empty." });
+  let parent = null;
+  if (req.body.parent_id) {
+    const p = await q("select id, parent_id from comments where id = $1 and video_id = $2", [int(req.body.parent_id), id]);
+    if (!p.rows[0]) return res.status(400).json({ error: "That comment no longer exists." });
+    parent = p.rows[0].parent_id || p.rows[0].id; // replies are one level deep
+  }
+  const cid = int(req.get("x-channel-id")), author = cid && (await owns(req, cid)) ? cid : null;
+  await q("insert into comments (video_id, body, channel_id, parent_id) values ($1,$2,$3,$4)", [id, body, author, parent]);
+  res.json({ ok: true });
+}));
+
+app.post("/api/comments/:id/like", rate("cl", 120, 60e3), wrap(async (req, res) => {
+  const r = await q("update comments set likes = greatest(likes + $2, 0) where id = $1 returning likes", [int(req.params.id), req.body.delta === -1 ? -1 : 1]);
+  if (!r.rows[0]) return notFound(res);
+  res.json({ likes: r.rows[0].likes });
+}));
+
+app.post("/api/comments/:id/pin", wrap(async (req, res) => {
+  const id = int(req.params.id);
+  const r = await q("select c.video_id, c.parent_id, v.channel_id from comments c join videos v on v.id = c.video_id where c.id = $1", [id]);
+  if (!r.rows[0]) return notFound(res);
+  if (!(await owns(req, r.rows[0].channel_id))) return forbid(res);
+  if (r.rows[0].parent_id) return res.status(400).json({ error: "Only top-level comments can be pinned." });
+  await q("update comments set pinned = (id = $1 and not pinned) where video_id = $2 and (pinned or id = $1)", [id, r.rows[0].video_id]);
+  res.json({ ok: true });
+}));
+
+app.get("/api/channels/:id/posts", wrap(async (req, res) => {
+  const r = await q("select id, body, likes, (extract(epoch from created) * 1000)::float8 as created from posts where channel_id = $1 order by created desc limit 50", [int(req.params.id)]);
+  res.json(r.rows);
+}));
+app.post("/api/channels/:id/posts", rate("post", 20, 3600e3), wrap(async (req, res) => {
+  const id = int(req.params.id);
+  if (!(await owns(req, id))) return forbid(res);
+  const body = String(req.body.body || "").trim().slice(0, 1000);
+  if (!body) return res.status(400).json({ error: "Write something first." });
+  await q("insert into posts (channel_id, body) values ($1,$2)", [id, body]);
+  res.json({ ok: true });
+}));
+app.post("/api/posts/:id/like", rate("pl2", 120, 60e3), wrap(async (req, res) => {
+  const r = await q("update posts set likes = greatest(likes + $2, 0) where id = $1 returning likes", [int(req.params.id), req.body.delta === -1 ? -1 : 1]);
+  if (!r.rows[0]) return notFound(res);
+  res.json({ likes: r.rows[0].likes });
+}));
+app.delete("/api/posts/:id", wrap(async (req, res) => {
+  const r = await q("select channel_id from posts where id = $1", [int(req.params.id)]);
+  if (!r.rows[0]) return notFound(res);
+  if (!(await owns(req, r.rows[0].channel_id))) return forbid(res);
+  await q("delete from posts where id = $1", [int(req.params.id)]);
+  res.json({ ok: true });
+}));
+
+/* ---------- admin tools ---------- */
+const like = (s) => "%" + String(s || "").replace(/[%_\\]/g, "\\$&") + "%";
+app.get("/api/admin/overview", needAdmin, wrap(async (req, res) => {
+  const r = await q(`select
+    (select count(*) from videos)::int as videos,
+    (select count(*) from videos where visibility='public')::int as v_public,
+    (select count(*) from videos where visibility='unlisted')::int as v_unlisted,
+    (select count(*) from videos where visibility='private')::int as v_private,
+    (select count(*) from channels)::int as channels, (select count(*) from channels where suspended)::int as suspended,
+    (select count(*) from playlists)::int as playlists, (select count(*) from comments)::int as comments,
+    (select count(*) from comments where created > now() - interval '24 hours')::int as comments_24h,
+    (select count(*) from videos where created > now() - interval '24 hours')::int as uploads_24h,
+    (select count(*) from reports where not resolved)::int as open_reports,
+    (select coalesce(sum(views),0) from videos)::float8 as views,
+    (select coalesce(sum(size),0) from videos)::float8 as bytes,
+    pg_database_size(current_database())::float8 as db_bytes`);
+  res.json(r.rows[0]);
+}));
+app.get("/api/admin/videos", needAdmin, wrap(async (req, res) => {
+  const s = String(req.query.q || "").trim();
+  const r = await q(`select v.id, v.title, v.visibility, v.audience, v.category, v.size, v.views, v.likes, v.status, v.channel_id, c.name as channel,
+      (extract(epoch from v.created) * 1000)::float8 as date,
+      (select count(*) from reports r where r.video_id = v.id and not r.resolved)::int as reports
+    from videos v left join channels c on c.id = v.channel_id
+    ${s ? "where v.title ilike $1 or c.name ilike $1" : ""} order by v.created desc limit 300`, s ? [like(s)] : []);
+  res.json(r.rows);
+}));
+app.post("/api/admin/videos/:id/visibility", needAdmin, wrap(async (req, res) => {
+  const vis = req.body.visibility;
+  if (!VIS.includes(vis)) return res.status(400).json({ error: "Invalid visibility." });
+  const r = await q("update videos set visibility = $2 where id = $1 returning title", [int(req.params.id), vis]);
+  if (!r.rows[0]) return notFound(res);
+  await audit("video_visibility", `#${req.params.id} “${r.rows[0].title}” set to ${vis}`);
+  res.json({ ok: true });
+}));
+app.get("/api/admin/channels", needAdmin, wrap(async (req, res) => {
+  const r = await q(`select c.id, c.name, c.suspended, (extract(epoch from c.created) * 1000)::float8 as date,
+    (select count(*) from videos v where v.channel_id = c.id)::int as vcount,
+    (select count(*) from channel_subscriptions s where s.channel_id = c.id)::int as subs
+    from channels c order by c.created desc`);
+  res.json(r.rows);
+}));
+app.post("/api/admin/channels/:id/suspend", needAdmin, wrap(async (req, res) => {
+  const on = !!req.body.suspended;
+  const r = await q("update channels set suspended = $2 where id = $1 returning name", [int(req.params.id), on]);
+  if (!r.rows[0]) return notFound(res);
+  await audit(on ? "channel_suspend" : "channel_restore", `#${req.params.id} ${r.rows[0].name}`);
+  res.json({ ok: true });
+}));
+app.get("/api/admin/reports", needAdmin, wrap(async (req, res) => {
+  const r = await q(`select r.id, r.reason, r.detail, (extract(epoch from r.created) * 1000)::float8 as date, r.video_id,
+      v.title, v.channel_id, c.name as channel
+    from reports r join videos v on v.id = r.video_id left join channels c on c.id = v.channel_id
+    where not r.resolved order by r.created desc limit 200`);
+  res.json(r.rows);
+}));
+app.post("/api/admin/reports/:id/resolve", needAdmin, wrap(async (req, res) => {
+  const id = int(req.params.id), action = String(req.body.action || "dismiss");
+  const rep = await q("select r.video_id, v.title from reports r join videos v on v.id = r.video_id where r.id = $1", [id]);
+  if (!rep.rows[0]) return notFound(res);
+  const { video_id, title } = rep.rows[0];
+  if (action === "private") await q("update videos set visibility = 'private' where id = $1", [video_id]);
+  await q("update reports set resolved = true where video_id = $1", [video_id]);
+  if (action === "delete") await q("delete from videos where id = $1", [video_id]);
+  await audit("report_" + action, `#${video_id} “${title}”`);
+  res.json({ ok: true });
+}));
+app.get("/api/admin/comments", needAdmin, wrap(async (req, res) => {
+  const r = await q(`select cm.id, cm.body, (extract(epoch from cm.created) * 1000)::float8 as date, cm.video_id, v.title
+    from comments cm join videos v on v.id = cm.video_id order by cm.created desc limit 100`);
+  res.json(r.rows);
+}));
+app.get("/api/admin/settings", needAdmin, wrap(async (req, res) =>
+  res.json({ announcement: await setting("announcement"), lockSignup: (await setting("lock_signup")) === "1" })));
+app.put("/api/admin/settings", needAdmin, wrap(async (req, res) => {
+  const text = String(req.body.announcement || "").trim().slice(0, 240);
+  await putSetting("announcement", text); await putSetting("lock_signup", req.body.lockSignup ? "1" : "0");
+  await audit("settings", `announcement ${text ? "set" : "cleared"}, new channels ${req.body.lockSignup ? "locked" : "open"}`);
+  res.json({ ok: true });
+}));
+app.get("/api/admin/audit", needAdmin, wrap(async (req, res) => {
+  const r = await q("select action, detail, (extract(epoch from created) * 1000)::float8 as date from audit_log order by id desc limit 100");
+  res.json(r.rows);
+}));
+app.get("/api/admin/export", needAdmin, wrap(async (req, res) => {
+  const [ch, vd, pl, cm] = await Promise.all([
+    q("select id, name, descr, emoji, color, suspended, created from channels order by id"),
+    q("select id, channel_id, title, descr, category, visibility, duration, size, views, likes, is_short, status, created from videos order by id"),
+    q("select id, channel_id, title, descr, created from playlists order by id"),
+    q("select id, video_id, body, created from comments order by id")]);
+  res.set({ "Content-Type": "application/json", "Content-Disposition": 'attachment; filename="opentube-backup.json"' });
+  await audit("export", "metadata backup downloaded");
+  res.send(JSON.stringify({ exported: new Date().toISOString(), note: "Metadata only. Video files and channel keys are not included.", channels: ch.rows, videos: vd.rows, playlists: pl.rows, comments: cm.rows }, null, 2));
+}));
+
+app.post("/api/videos/:id/report", rate("rep", 10, 3600e3), wrap(async (req, res) => {
+  const id = int(req.params.id);
+  const ok = await q("select 1 from videos where id = $1", [id]);
+  if (!ok.rows[0]) return notFound(res);
+  const reason = ["spam", "harmful", "copyright", "other"].includes(req.body.reason) ? req.body.reason : "other";
+  await q("insert into reports (video_id, reason, detail) values ($1,$2,$3)", [id, reason, String(req.body.detail || "").trim().slice(0, 300)]);
+  res.json({ ok: true });
+}));
+
 /* ---------- errors + startup ---------- */
 app.use((err, req, res, next) => {
   if (err.code === "LIMIT_FILE_SIZE") return res.status(413).json({ error: `File is too large. The limit is ${MAX_MB} MB.` });
@@ -351,6 +813,36 @@ app.use((err, req, res, next) => {
       size integer not null, data bytea not null, views integer not null default 0,
       likes integer not null default 0, created timestamptz not null default now());
     alter table videos add column if not exists channel_id integer references channels(id) on delete cascade;
+    alter table videos add column if not exists dislikes integer not null default 0;
+    alter table videos add column if not exists width integer not null default 0;
+    alter table videos add column if not exists height integer not null default 0;
+    alter table videos add column if not exists is_short boolean not null default false;
+    alter table videos add column if not exists status text not null default 'published';
+    alter table videos add column if not exists premiere_at timestamptz;
+    alter table videos add column if not exists category text not null default '';
+    alter table channels add column if not exists emoji text not null default '';
+    alter table channels add column if not exists color text not null default '';
+    alter table channels add column if not exists suspended boolean not null default false;
+    alter table videos add column if not exists visibility text not null default 'public';
+    alter table videos add column if not exists share_key text;
+    update videos set share_key = substr(md5(random()::text || clock_timestamp()::text || id::text), 1, 16) where share_key is null;
+    create table if not exists reports (id serial primary key, video_id integer not null references videos(id) on delete cascade, reason text not null, detail text not null default '', created timestamptz not null default now(), resolved boolean not null default false);
+    create table if not exists site_settings (key text primary key, value text not null default '');
+    create table if not exists audit_log (id serial primary key, action text not null, detail text not null default '', created timestamptz not null default now());
+    alter table videos add column if not exists audience text not null default 'general';
+    alter table comments add column if not exists channel_id integer references channels(id) on delete set null;
+    alter table comments add column if not exists parent_id integer references comments(id) on delete cascade;
+    alter table comments add column if not exists likes integer not null default 0;
+    alter table comments add column if not exists pinned boolean not null default false;
+    create table if not exists posts (id serial primary key, channel_id integer not null references channels(id) on delete cascade, body text not null, likes integer not null default 0, created timestamptz not null default now());
+    create table if not exists video_votes (
+      video_id integer not null references videos(id) on delete cascade,
+      viewer_id text not null, vote smallint not null check (vote in (-1,1)),
+      created timestamptz not null default now(), primary key (video_id, viewer_id));
+    insert into video_votes (video_id, viewer_id, vote)
+      select v.id, 'legacy-like-' || v.id || '-' || n::text, 1
+      from videos v cross join lateral generate_series(1, least(v.likes, 10000)) as gs(n)
+      where v.likes > 0 and not exists (select 1 from video_votes x where x.video_id = v.id);
     create table if not exists comments (
       id serial primary key, video_id integer not null references videos(id) on delete cascade,
       body text not null, created timestamptz not null default now());
@@ -360,6 +852,34 @@ app.use((err, req, res, next) => {
     create table if not exists playlist_items (
       playlist_id integer not null references playlists(id) on delete cascade,
       video_id integer not null references videos(id) on delete cascade,
-      pos integer not null, primary key (playlist_id, video_id));`);
+      pos integer not null, primary key (playlist_id, video_id));
+    create table if not exists channel_subscriptions (
+      channel_id integer not null references channels(id) on delete cascade,
+      viewer_id text not null, created timestamptz not null default now(), primary key(channel_id,viewer_id));
+    create table if not exists saved_videos (
+      viewer_id text not null, video_id integer not null references videos(id) on delete cascade,
+      created timestamptz not null default now(), primary key(viewer_id,video_id));
+    create table if not exists premiere_chat (
+      id bigserial primary key, video_id integer not null references videos(id) on delete cascade,
+      viewer_id text not null, nickname text not null default 'Guest', body text not null,
+      created timestamptz not null default now());
+    create index if not exists premiere_chat_video_id_idx on premiere_chat(video_id,id);
+    create table if not exists live_chat (
+      id bigserial primary key, channel_id integer not null references channels(id) on delete cascade,
+      viewer_id text not null, nickname text not null default 'Guest', body text not null,
+      created timestamptz not null default now());
+    create index if not exists live_chat_channel_id_idx on live_chat(channel_id,id);
+    create table if not exists live_presence (
+      channel_id integer not null references channels(id) on delete cascade,
+      viewer_id text not null, seen timestamptz not null default now(), primary key(channel_id,viewer_id));
+    create table if not exists live_streams (
+      channel_id integer primary key references channels(id) on delete cascade,
+      title text not null default 'Live stream', quality text not null default '1080p',
+      key_hash text not null, created timestamptz not null default now(),
+      provider text not null default 'ssh101', provider_uid text, playback_url text, ingest_url text);
+    alter table live_streams add column if not exists provider text not null default 'ssh101';
+    alter table live_streams add column if not exists provider_uid text;
+    alter table live_streams add column if not exists playback_url text;
+    alter table live_streams add column if not exists ingest_url text;`);
   app.listen(PORT, () => console.log(`OpenTube running on port ${PORT}`));
 })().catch((e) => { console.error("Startup failed:", e.message); process.exit(1); });

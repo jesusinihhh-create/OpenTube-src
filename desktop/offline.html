@@ -1,0 +1,9 @@
+<!doctype html><html><head><meta charset="utf-8"><title>OpenTube</title>
+<style>body{margin:0;height:100vh;display:grid;place-items:center;background:#141414;color:#f2f2f2;font:16px "Segoe UI",sans-serif;text-align:center}
+.b{max-width:420px;padding:24px}.i{width:84px;height:84px;margin:0 auto 18px;border-radius:26px;background:linear-gradient(135deg,#d9262c,#7b4dff);display:grid;place-items:center;font-size:34px}
+button{margin-top:16px;border:0;border-radius:22px;padding:10px 22px;font:inherit;color:#fff;background:#d9262c;cursor:pointer}p{color:#a3a3a3}</style></head>
+<body><div class="b"><div class="i">▶</div><h2>Can’t reach OpenTube</h2>
+<p id="m">Check your internet connection, then try again.</p><button id="r">Try again</button></div>
+<script>const u=new URLSearchParams(location.search).get("url");
+if(!u){document.getElementById("m").textContent="This app has no site address yet. Rebuild it with your OpenTube address.";document.getElementById("r").style.display="none"}
+document.getElementById("r").onclick=()=>{location.href=u}</script></body></html>
